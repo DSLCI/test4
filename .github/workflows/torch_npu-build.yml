@@ -1,0 +1,124 @@
+name: Build pytorch-npu (PyTorch 2.1.0+cpu)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc g++ git patchelf ccache
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ubuntu22-v7.2.0-pytorch2.1.0-${{ github.run_id }}
+          restore-keys: |
+            ccache-ubuntu22-v7.2.0-pytorch2.1.0-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=2G
+          ccache --zero-stats
+          echo "CC=ccache gcc" >> $GITHUB_ENV
+          echo "CXX=ccache g++" >> $GITHUB_ENV
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.1.0+cpu
+          python -m pip install pyyaml setuptools auditwheel
+
+      - name: Clone Ascend/pytorch
+        id: clone
+        run: |
+          git clone --depth=1 --branch v7.2.0-pytorch2.1.0 --recurse-submodules https://github.com/Ascend/pytorch ascend_pytorch
+          cd ascend_pytorch
+          COMMIT_HASH=$(git rev-parse HEAD)
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          COMMIT_DATE=$(git log -1 --format=%cd --date=short)
+          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
+          echo "commit_short=${COMMIT_SHORT}" >> $GITHUB_OUTPUT
+          echo "commit_date=${COMMIT_DATE}" >> $GITHUB_OUTPUT
+
+      - name: Build CANN stub libraries
+        run: |
+          bash ascend_pytorch/third_party/acl/libs/build_stub.sh
+
+      - name: Build wheel
+        id: build
+        run: |
+          cd ascend_pytorch
+          export DISABLE_INSTALL_TORCHAIR=TRUE
+          export DISABLE_RPC_FRAMEWORK=TRUE
+          export BUILD_WITHOUT_SHA=1
+          set -o pipefail
+          python setup.py build bdist_wheel 2>&1 | tee ../build.log
+
+      - name: Show ccache statistics
+        if: always()
+        run: |
+          echo "## CCache Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          ccache --show-stats >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload wheel artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: torch_npu-wheel-${{ github.run_number }}
+          path: ascend_pytorch/dist/*.whl
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build.log
+          retention-days: 30
+
+      - name: Output build summary
+        if: always()
+        run: |
+          echo "## Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| PyTorch Version | 2.1.0+cpu |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ascend/pytorch Commit | [${{ steps.clone.outputs.commit_short }}](https://github.com/Ascend/pytorch/commit/${{ steps.clone.outputs.commit_hash }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit Date | ${{ steps.clone.outputs.commit_date }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Build Result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -d "ascend_pytorch/dist" ] && ls ascend_pytorch/dist/*.whl 1> /dev/null 2>&1; then
+            echo "✅ **Build succeeded!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Wheel files:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            while IFS= read -r whl; do
+              echo "- \`${whl}\`" >> $GITHUB_STEP_SUMMARY
+            done < <(ls ascend_pytorch/dist/*.whl)
+          else
+            echo "❌ **Build failed.**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the build-log artifact for details." >> $GITHUB_STEP_SUMMARY
+          fi
