@@ -1,0 +1,160 @@
+diff --git a/torch_npu/csrc/core/npu/CachingHostAllocator.cpp b/torch_npu/csrc/core/npu/CachingHostAllocator.cpp
+index 738b91b..4538f37 100644
+--- a/torch_npu/csrc/core/npu/CachingHostAllocator.cpp
++++ b/torch_npu/csrc/core/npu/CachingHostAllocator.cpp
+@@ -46,10 +46,10 @@ using Comparison = bool (*)(const ExpandableBlock *, const ExpandableBlock *);
+ static bool BlockComparatorSize(const ExpandableBlock *a, const ExpandableBlock *b);
+ static bool BlockComparatorAddress(const ExpandableBlock *a, const ExpandableBlock *b);
+ 
+-struct BlockPool {
++struct ExpandableBlockPool {
+     std::set<ExpandableBlock *, Comparison> blocks;
+     std::set<ExpandableBlock *, Comparison> unmapped;
+-    BlockPool() : blocks(BlockComparatorSize), unmapped(BlockComparatorAddress) {
++    ExpandableBlockPool() : blocks(BlockComparatorSize), unmapped(BlockComparatorAddress) {
+     }
+ };
+ 
+@@ -57,7 +57,7 @@ struct ExpandableSegment;
+ 
+ struct ExpandableBlock : at::HostBlock<c10_npu::NPUStream>{
+     size_t requested_size{};  // memory originally requested
+-    BlockPool *pool{};        // owning memory pool
++    ExpandableBlockPool *pool{};        // owning memory pool
+     bool mapped{ true };    // is the virtual address range this Block references
+                             // backed by physical pages. Always true when
+                             // expandable_segment_ is null. When false
+@@ -72,7 +72,7 @@ struct ExpandableBlock : at::HostBlock<c10_npu::NPUStream>{
+           next(nullptr)
+         {}
+ 
+-    ExpandableBlock(const size_t size, BlockPool *pool, void *ptr)
++    ExpandableBlock(const size_t size, ExpandableBlockPool *pool, void *ptr)
+         : HostBlock(size, ptr),
+           pool(pool),
+           prev(nullptr),
+@@ -404,7 +404,7 @@ struct ExpandableSegment {
+     // returns the actual range mapped, which may be
+     // greater than requested if size is not aligned to segment_size_.
+     // return size of 0 indicates OOM
+-    SegmentRange map(SegmentRange range, BlockPool *pool)
++    SegmentRange map(SegmentRange range, ExpandableBlockPool *pool)
+     {
+         auto begin = segmentLeft(range.ptr);
+         auto end = segmentRight(range.ptr + range.size);
+@@ -543,7 +543,7 @@ private:
+ };
+ 
+ struct AllocParams {
+-    AllocParams(size_t size, BlockPool *pool)
++    AllocParams(size_t size, ExpandableBlockPool *pool)
+         : search_key(size),
+           pool(pool),
+           err(ACL_ERROR_NONE)
+@@ -556,7 +556,7 @@ struct AllocParams {
+ 
+     ExpandableBlock search_key;
+ 
+-    BlockPool *pool;
++    ExpandableBlockPool *pool;
+ 
+     ExpandableBlock *block{};
+ 
+@@ -573,7 +573,7 @@ public:
+ 
+         std::lock_guard<std::mutex> lock(mutex);
+ 
+-        process_events();
++        do_process_npu_events();
+ 
+         const auto size = round_size(orig_size);
+ 
+@@ -685,7 +685,7 @@ public:
+     }
+ 
+ private:
+-    BlockPool blocks_pool;
++    ExpandableBlockPool blocks_pool;
+ 
+     std::mutex mutex;
+ 
+@@ -837,7 +837,7 @@ private:
+     }
+ 
+     /* * combine previously split blocks. returns the size of the subsumed block, or 0 on failure. * */
+-    size_t try_merge_blocks(ExpandableBlock *dst, ExpandableBlock *src, BlockPool &pool)
++    size_t try_merge_blocks(ExpandableBlock *dst, ExpandableBlock *src, ExpandableBlockPool &pool)
+     {
+         if (!src || src->allocated_ || src->event_count_ > 0 || !src->streams_.empty() || dst->mapped != src->mapped) {
+             return 0;
+@@ -885,7 +885,15 @@ private:
+         pool.blocks.insert(block);
+     }
+ 
+-    void process_events() override
++    // Override new PyTorch API: process_events(BlockPool& pool).
++    // NPUExpandableHostAllocatorImpl manages its own NPU event queue
++    // independently of the base-class pool, so the pool argument is unused.
++    void process_events(BlockPool& /* pool */) override
++    {
++        do_process_npu_events();
++    }
++
++    void do_process_npu_events()
+     {
+         while (true) {
+             // Avoid calling cudaEventDestroy while holding a mutex, so move
+@@ -970,7 +978,7 @@ private:
+ 
+     bool get_free_expandable_block(AllocParams &p)
+     {
+-        BlockPool &pool = *p.pool;
++        ExpandableBlockPool &pool = *p.pool;
+         auto it = pool.blocks.lower_bound(&p.search_key);
+         if (it == pool.blocks.end()) {
+             return false;
+@@ -1012,7 +1020,7 @@ private:
+     // returns the smallest possible address in any segment
+     // where there is enough free address space to fit size
+     // may be composed of free and unmapped segments
+-    ExpandableBlock *find_expandable_block(BlockPool *pool, size_t size)
++    ExpandableBlock *find_expandable_block(ExpandableBlockPool *pool, size_t size)
+     {
+         ExpandableBlock key(0);
+ 
+@@ -1061,7 +1069,7 @@ private:
+         return candidate;
+     }
+ 
+-    bool map_block(ExpandableBlock *to_map, size_t size, BlockPool *map_pool)
++    bool map_block(ExpandableBlock *to_map, size_t size, ExpandableBlockPool *map_pool)
+     {
+         TORCH_INTERNAL_ASSERT(!to_map->mapped && size <= to_map->size_, PTA_ERROR(ErrCode::VALUE));
+ 
+@@ -1073,7 +1081,7 @@ private:
+         TORCH_INTERNAL_ASSERT(mapped_range.ptr == to_map->ptr_ && mapped_range.size >= size,
+             PTA_ERROR(ErrCode::INTERNAL));
+ 
+-        BlockPool &pool = *to_map->pool;
++        ExpandableBlockPool &pool = *to_map->pool;
+         pool.unmapped.erase(to_map);
+         to_map->mapped = true;
+ 
+@@ -1098,7 +1106,7 @@ private:
+         return true;
+     }
+ 
+-    ExpandableBlock *try_allocate_expandable_block(BlockPool *pool, size_t size)
++    ExpandableBlock *try_allocate_expandable_block(ExpandableBlockPool *pool, size_t size)
+     {
+         ExpandableBlock *candidate = find_expandable_block(pool, size);
+         // Candidate is now a list free/unmapped blocks with at least size room:
+@@ -1178,7 +1186,7 @@ private:
+     {
+         // First ensure that all blocks that can't currently be allocated due to
+         // outstanding events are returned to the pool.
+-        process_events();
++        do_process_npu_events();
+ 
+         // Free all non-split cached blocks
+         release_blocks();
